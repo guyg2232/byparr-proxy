@@ -1,0 +1,32 @@
+# Minimal stack to demonstrate byparr-proxy in front of Byparr.
+# Drop this into your existing arr-stack compose, or run it standalone
+# and have Prowlarr (running elsewhere on the same Docker network) point
+# its custom 1337x indexer at http://byparr-proxy:8888/.
+
+services:
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    restart: unless-stopped
+    ports:
+      - "8191:8191"
+
+  byparr-proxy:
+    # Build from the Dockerfile in this directory:
+    build: .
+    container_name: byparr-proxy
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    environment:
+      UPSTREAM: https://1337x.to
+      BYPARR: http://byparr:8191/v1
+      TIMEOUT_MS: "120000"
+      PORT: "8888"
+    depends_on:
+      - byparr
+
+# To proxy a second indexer, copy the byparr-proxy block, give it a unique
+# container_name (e.g. byparr-proxy-yts), a unique host port (e.g. 8889),
+# and change UPSTREAM. Then add a matching Cardigann definition pointing
+# at the new container.
