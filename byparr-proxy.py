@@ -249,12 +249,23 @@ class Handler(BaseHTTPRequestHandler):
             return None, None, None, byparr_elapsed
 
         byparr_elapsed = time.monotonic() - byparr_start
+        # Treat a body with no torrent rows as "empty" and skip caching it.
+        # Empty pages happen when the search legitimately has no matches,
+        # when Cloudflare served a challenge page instead of the real
+        # content, or on transient upstream errors. None of these should
+        # be pinned for an hour. Detection is content-based (presence of
+        # the /torrent/ link prefix that every result row carries) rather
+        # than size-based, so it doesn't depend on byte counts.
+        has_results = b"/torrent/" in body
         with _state_lock:
             _inflight.pop(path, None)
-            if 200 <= status < 300:
+            if 200 <= status < 300 and has_results:
                 _cache[path] = (time.monotonic() + CACHE_TTL_S, status, body)
                 log.info("[%s] %s %s -> cached for %ds (status %d, %d bytes)",
                          rid, method, path, CACHE_TTL_S, status, len(body))
+            elif 200 <= status < 300:
+                log.info("[%s] %s %s -> not cached (empty results, %d bytes)",
+                         rid, method, path, len(body))
         pending.status = status
         pending.body = body
         pending.event.set()
