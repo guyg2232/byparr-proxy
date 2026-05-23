@@ -12,12 +12,14 @@ Configuration is via environment variables:
   TIMEOUT_MS  per-request timeout passed to Byparr (default 120000)
   PORT        local listen port (default 8888)
   LOG_LEVEL   DEBUG, INFO, WARNING, ERROR (default INFO)
+  CACHE_TTL_S TTL for successful response cache, in seconds (default 3600)
 """
 import json
 import logging
 import os
 import re
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -28,6 +30,7 @@ BYPARR = os.environ.get("BYPARR", "http://byparr:8191/v1")
 TIMEOUT_MS = int(os.environ.get("TIMEOUT_MS", "120000"))
 PORT = int(os.environ.get("PORT", "8888"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+CACHE_TTL_S = int(os.environ.get("CACHE_TTL_S", "3600"))
 
 # Skip static assets -- Prowlarr never needs them, and forwarding them to Byparr
 # wastes a full Cloudflare-solve cycle per request.
@@ -43,6 +46,50 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("byparr-proxy")
+
+
+class _Pending:
+    __slots__ = ("event", "status", "body", "error")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.status = None
+        self.body = None
+        self.error = None
+
+
+# Cache successful upstream responses for CACHE_TTL_S. Sonarr/Radarr/Prowlarr
+# poll the same indexer-test endpoints (e.g. /cat/TV/1/) on independent
+# schedules; without this, each poll triggers a full Cloudflare solve and
+# the bursts cause Byparr to 408 on queued requests.
+_cache = {}          # path -> (expires_at_monotonic, status, body)
+_inflight = {}       # path -> _Pending
+_state_lock = threading.Lock()
+# Byparr drives a real browser, so it effectively serializes. Holding this
+# while calling Byparr keeps a burst from sharing a single maxTimeout window
+# across N concurrent requests (which is what caused the 408s).
+_byparr_lock = threading.Lock()
+
+
+def _fetch_from_byparr(rid, target):
+    """Call Byparr and return (status, body). Raises on failure."""
+    payload = json.dumps({
+        "cmd": "request.get",
+        "url": target,
+        "maxTimeout": TIMEOUT_MS,
+    }).encode()
+    req = urllib.request.Request(
+        BYPARR,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT_MS / 1000 + 15) as resp:
+        data = json.loads(resp.read())
+    if data.get("status") != "ok":
+        raise RuntimeError(f"byparr returned: {data.get('message', 'unknown')}")
+    sol = data["solution"]
+    return sol.get("status", 200), sol["response"].encode("utf-8", errors="replace")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -61,52 +108,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        target = UPSTREAM + path
-        log.info("[%s] %s %s from %s -> forwarding to byparr (%s)",
-                 rid, method, path, client, target)
-
-        payload = json.dumps({
-            "cmd": "request.get",
-            "url": target,
-            "maxTimeout": TIMEOUT_MS,
-        }).encode()
-        req = urllib.request.Request(
-            BYPARR,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        byparr_start = time.monotonic()
-        try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT_MS / 1000 + 15) as resp:
-                raw = resp.read()
-                data = json.loads(raw)
-        except Exception as e:
-            elapsed = time.monotonic() - start
-            log.error("[%s] %s %s <- byparr request failed after %.2fs: %s",
-                      rid, method, path, elapsed, e)
-            self.send_error(502, f"byparr request failed: {e}")
+        status, body, source, byparr_elapsed = self._get(rid, method, path, client)
+        if status is None:
+            # error already sent
             return
 
-        byparr_elapsed = time.monotonic() - byparr_start
-
-        if data.get("status") != "ok":
-            elapsed = time.monotonic() - start
-            msg = data.get("message", "unknown")
-            log.warning("[%s] %s %s <- byparr returned non-ok in %.2fs: %s",
-                        rid, method, path, byparr_elapsed, msg)
-            self.send_error(502, f"byparr returned: {msg}")
-            return
-
-        sol = data["solution"]
-        body = sol["response"].encode("utf-8", errors="replace")
-        upstream_status = sol.get("status", 200)
-        upstream_url = sol.get("url", target)
-
-        log.debug("[%s] byparr solved in %.2fs: %d, %d bytes, final url=%s",
-                  rid, byparr_elapsed, upstream_status, len(body), upstream_url)
-
-        self.send_response(upstream_status)
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -114,9 +121,77 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
         elapsed = time.monotonic() - start
-        log.info("[%s] %s %s <- %d in %.2fs (byparr %.2fs, %d bytes)",
-                 rid, method, path, upstream_status, elapsed,
-                 byparr_elapsed, len(body))
+        if source == "cache":
+            log.info("[%s] %s %s <- %d in %.2fs (cache hit, %d bytes)",
+                     rid, method, path, status, elapsed, len(body))
+        elif source == "coalesced":
+            log.info("[%s] %s %s <- %d in %.2fs (coalesced with in-flight, %d bytes)",
+                     rid, method, path, status, elapsed, len(body))
+        else:
+            log.info("[%s] %s %s <- %d in %.2fs (byparr %.2fs, %d bytes)",
+                     rid, method, path, status, elapsed,
+                     byparr_elapsed, len(body))
+
+    def _get(self, rid, method, path, client):
+        """Return (status, body, source, byparr_elapsed) or (None, ...) on error."""
+        now = time.monotonic()
+
+        with _state_lock:
+            entry = _cache.get(path)
+            if entry and entry[0] > now:
+                age = CACHE_TTL_S - (entry[0] - now)
+                log.info("[%s] %s %s from %s -> cache hit (age %.0fs, ttl %ds)",
+                         rid, method, path, client, age, CACHE_TTL_S)
+                return entry[1], entry[2], "cache", 0.0
+
+            pending = _inflight.get(path)
+            if pending is not None:
+                log.info("[%s] %s %s from %s -> coalescing with in-flight request",
+                         rid, method, path, client)
+                owner = False
+            else:
+                pending = _Pending()
+                _inflight[path] = pending
+                owner = True
+
+        if not owner:
+            pending.event.wait(timeout=TIMEOUT_MS / 1000 + 30)
+            if pending.error is not None:
+                log.error("[%s] %s %s <- coalesced request failed: %s",
+                          rid, method, path, pending.error)
+                self.send_error(502, f"byparr request failed: {pending.error}")
+                return None, None, None, 0.0
+            return pending.status, pending.body, "coalesced", 0.0
+
+        target = UPSTREAM + path
+        log.info("[%s] %s %s from %s -> forwarding to byparr (%s)",
+                 rid, method, path, client, target)
+        byparr_start = time.monotonic()
+        try:
+            with _byparr_lock:
+                status, body = _fetch_from_byparr(rid, target)
+        except Exception as e:
+            byparr_elapsed = time.monotonic() - byparr_start
+            with _state_lock:
+                _inflight.pop(path, None)
+            pending.error = e
+            pending.event.set()
+            log.error("[%s] %s %s <- byparr request failed after %.2fs: %s",
+                      rid, method, path, byparr_elapsed, e)
+            self.send_error(502, f"byparr request failed: {e}")
+            return None, None, None, byparr_elapsed
+
+        byparr_elapsed = time.monotonic() - byparr_start
+        with _state_lock:
+            _inflight.pop(path, None)
+            if 200 <= status < 300:
+                _cache[path] = (time.monotonic() + CACHE_TTL_S, status, body)
+                log.info("[%s] %s %s -> cached for %ds (status %d, %d bytes)",
+                         rid, method, path, CACHE_TTL_S, status, len(body))
+        pending.status = status
+        pending.body = body
+        pending.event.set()
+        return status, body, "fresh", byparr_elapsed
 
     def do_GET(self):
         self._proxy()
@@ -140,6 +215,7 @@ def main():
     log.info("  timeout:    %d ms", TIMEOUT_MS)
     log.info("  port:       %d", PORT)
     log.info("  log level:  %s", LOG_LEVEL)
+    log.info("  cache ttl:  %d s", CACHE_TTL_S)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     log.info("ready, listening on 0.0.0.0:%d", PORT)
     try:
