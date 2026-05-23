@@ -13,6 +13,11 @@ Configuration is via environment variables:
   PORT        local listen port (default 8888)
   LOG_LEVEL   DEBUG, INFO, WARNING, ERROR (default INFO)
   CACHE_TTL_S TTL for successful response cache, in seconds (default 3600)
+  STUB_CAT_PATHS  if truthy, /cat/... paths (indexer test endpoints) skip
+                  Byparr and return a synthetic empty result page.
+                  Useful as a temporary mitigation when Byparr can't solve
+                  the Cloudflare challenge on the category pages but real
+                  searches still work. (default off)
 """
 import json
 import logging
@@ -31,12 +36,23 @@ TIMEOUT_MS = int(os.environ.get("TIMEOUT_MS", "120000"))
 PORT = int(os.environ.get("PORT", "8888"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 CACHE_TTL_S = int(os.environ.get("CACHE_TTL_S", "3600"))
+STUB_CAT_PATHS = os.environ.get("STUB_CAT_PATHS", "").lower() in ("1", "true", "yes", "on")
 
 # Skip static assets -- Prowlarr never needs them, and forwarding them to Byparr
 # wastes a full Cloudflare-solve cycle per request.
 SKIP_EXT = re.compile(
     r"\.(css|js|mjs|map|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm)(\?|$)",
     re.IGNORECASE,
+)
+
+# Indexer "test" and "browse" endpoints in the cardigann definition all live
+# under /cat/<Category>/<page>/. Real keyword searches go to /search/ or
+# /sort-search/, so this regex isolates the test traffic.
+CAT_PATH = re.compile(r"^/cat/", re.IGNORECASE)
+
+STUB_BODY = (
+    b"<!DOCTYPE html><html><head><title>byparr-proxy stub</title></head>"
+    b"<body><table class=\"table-list\"></table></body></html>"
 )
 
 logging.basicConfig(
@@ -106,6 +122,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+
+        if STUB_CAT_PATHS and CAT_PATH.search(path):
+            log.info("[%s] %s %s from %s -> 200 stubbed (cat path, bypassing byparr)",
+                     rid, method, path, client)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(STUB_BODY)))
+            self.end_headers()
+            if method != "HEAD":
+                self.wfile.write(STUB_BODY)
             return
 
         status, body, source, byparr_elapsed = self._get(rid, method, path, client)
@@ -216,6 +243,7 @@ def main():
     log.info("  port:       %d", PORT)
     log.info("  log level:  %s", LOG_LEVEL)
     log.info("  cache ttl:  %d s", CACHE_TTL_S)
+    log.info("  stub /cat/: %s", "on" if STUB_CAT_PATHS else "off")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     log.info("ready, listening on 0.0.0.0:%d", PORT)
     try:
