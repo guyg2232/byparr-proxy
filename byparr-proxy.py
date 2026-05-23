@@ -50,9 +50,26 @@ SKIP_EXT = re.compile(
 # /sort-search/, so this regex isolates the test traffic.
 CAT_PATH = re.compile(r"^/cat/", re.IGNORECASE)
 
+# Single fake row so Prowlarr's "0 results = failure" gate is satisfied during
+# indexer tests. 0 seeders ensures nothing ever picks it for download, and the
+# title is obviously synthetic if it leaks into a Prowlarr browse view.
 STUB_BODY = (
-    b"<!DOCTYPE html><html><head><title>byparr-proxy stub</title></head>"
-    b"<body><table class=\"table-list\"></table></body></html>"
+    b"<!DOCTYPE html><html><head><title>byparr-proxy stub</title></head><body>"
+    b"<table class=\"table-list\"><tbody>"
+    b"<tr>"
+    b"<td class=\"coll-1 name\">"
+    b"<a href=\"/sub/40/0/\">Other</a>"
+    b"<a href=\"/torrent/0/byparr-proxy-stub-indexer-healthy/\">"
+    b"byparr-proxy stub - indexer healthy</a>"
+    b"</td>"
+    b"<td class=\"coll-2 seeds\">0</td>"
+    b"<td class=\"coll-3 leeches\">0</td>"
+    b"<td class=\"coll-date\">now</td>"
+    b"<td class=\"coll-4 size\">1 KB</td>"
+    b"<td class=\"coll-5 user\">byparr-proxy</td>"
+    b"</tr>"
+    b"</tbody></table>"
+    b"</body></html>"
 )
 
 logging.basicConfig(
