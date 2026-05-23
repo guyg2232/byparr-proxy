@@ -13,11 +13,15 @@ Configuration is via environment variables:
   PORT        local listen port (default 8888)
   LOG_LEVEL   DEBUG, INFO, WARNING, ERROR (default INFO)
   CACHE_TTL_S TTL for successful response cache, in seconds (default 3600)
-  STUB_CAT_PATHS  if truthy, /cat/... paths (indexer test endpoints) skip
-                  Byparr and return a synthetic empty result page.
-                  Useful as a temporary mitigation when Byparr can't solve
-                  the Cloudflare challenge on the category pages but real
-                  searches still work. (default off)
+  STUB_CAT_PATHS  if truthy (default), /cat/... paths (indexer test
+                  endpoints) skip Byparr and return a synthetic results
+                  page with one fake row per major category family.
+                  Cloudflare's protection on the category browse pages
+                  is significantly more aggressive than on keyword
+                  search, so probing them through Byparr flaps the
+                  indexer health even when real searches work fine.
+                  Set to "false" / "0" to disable and route /cat/...
+                  through Byparr like everything else.
 """
 import json
 import logging
@@ -36,7 +40,7 @@ TIMEOUT_MS = int(os.environ.get("TIMEOUT_MS", "120000"))
 PORT = int(os.environ.get("PORT", "8888"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 CACHE_TTL_S = int(os.environ.get("CACHE_TTL_S", "3600"))
-STUB_CAT_PATHS = os.environ.get("STUB_CAT_PATHS", "").lower() in ("1", "true", "yes", "on")
+STUB_CAT_PATHS = os.environ.get("STUB_CAT_PATHS", "true").lower() in ("1", "true", "yes", "on")
 
 # Skip static assets -- Prowlarr never needs them, and forwarding them to Byparr
 # wastes a full Cloudflare-solve cycle per request.

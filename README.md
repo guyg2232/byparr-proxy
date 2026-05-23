@@ -174,32 +174,77 @@ The proxy is single-upstream per instance — one container handles one site. To
 
 ## Configuration reference
 
-The proxy reads four environment variables:
+The proxy reads these environment variables:
 
-| Variable     | Default                      | Description                                              |
-| ------------ | ---------------------------- | -------------------------------------------------------- |
-| `UPSTREAM`   | `https://1337x.to`           | Base URL of the indexer the proxy should fetch from.     |
-| `BYPARR`     | `http://byparr:8191/v1`      | Byparr's `/v1` endpoint, reachable from the container.   |
-| `TIMEOUT_MS` | `120000`                     | Per-request timeout passed to Byparr (milliseconds). Bump higher if solves regularly exceed 2 minutes. |
-| `PORT`       | `8888`                       | Local port the proxy listens on.                         |
-| `LOG_LEVEL`  | `INFO`                       | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Set to `DEBUG` to see Byparr's solved URL and byte counts per request. |
+| Variable          | Default                      | Description                                              |
+| ----------------- | ---------------------------- | -------------------------------------------------------- |
+| `UPSTREAM`        | `https://1337x.to`           | Base URL of the indexer the proxy should fetch from.     |
+| `BYPARR`          | `http://byparr:8191/v1`      | Byparr's `/v1` endpoint, reachable from the container.   |
+| `TIMEOUT_MS`      | `120000`                     | Per-request timeout passed to Byparr (milliseconds). Bump higher if solves regularly exceed 2 minutes. |
+| `PORT`            | `8888`                       | Local port the proxy listens on.                         |
+| `LOG_LEVEL`       | `INFO`                       | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Set to `DEBUG` to see Byparr's solved URL and byte counts per request. |
+| `CACHE_TTL_S`     | `3600`                       | TTL (seconds) for caching successful responses. Cache is in-memory only; restart clears it. Set to `0` to disable. |
+| `STUB_CAT_PATHS`  | `true`                       | When on, `/cat/...` paths (used by indexer health-tests in Prowlarr/Sonarr/Radarr/Lidarr/Readarr) skip Byparr entirely and return a synthetic results page. Set to `false` to route them through Byparr like everything else. |
+
+### Why the cache and the stub
+
+Without these, the proxy was unusable under real *arr-stack load:
+
+- **Caching with in-flight dedup.** Sonarr, Radarr, and Prowlarr each poll the same indexer endpoints on independent schedules. Without dedup, three near-simultaneous health checks all triggered three concurrent Byparr solves, exhausting its per-request timeout window and producing `408 Request Timeout`. The cache (1h default) absorbs the *spaced-out* duplicates; in-flight coalescing absorbs *concurrent* ones. Empty result pages (no `/torrent/` links) are deliberately **not** cached, so a transient blank doesn't get pinned for an hour. Calls to Byparr itself are serialized — Byparr drives a real browser, so it effectively serializes anyway, but doing it explicitly in the proxy avoids the timeout-stacking problem.
+- **`/cat/...` stub.** Cloudflare's protection on 1337x's category browse pages is observably harder than on keyword search — when Byparr can't solve the category pages it returns 408 even though `https://1337x.to/search/<keyword>/1/` works fine. Since `/cat/...` is hit *only* by indexer health-checks (real searches go to `/search/...` or `/sort-search/...`), short-circuiting `/cat/...` to a synthetic response with one fake row per major category family keeps every *arr app's test green without touching real search traffic. The stub rows have 0 seeders and sentinel titles like `byparr-proxy stub - TV/HD healthy`, so they're harmless if they ever surface in a Prowlarr browse view.
 
 ### Reading the logs
 
-Every request gets a 6-character request ID so concurrent requests stay legible:
+Every request gets a 6-character request ID so concurrent requests stay legible. The startup banner shows which features are active:
 
 ```
-2026-05-20 21:02:15.430 INFO  [a1b2c3] GET /cat/Movies/1/ from 172.18.0.7 -> forwarding to byparr (https://1337x.to/cat/Movies/1/)
-2026-05-20 21:02:38.541 INFO  [a1b2c3] GET /cat/Movies/1/ <- 200 in 23.11s (byparr 23.09s, 31504 bytes)
-2026-05-20 21:02:39.100 INFO  [d4e5f6] GET /css/style.css from 172.18.0.7 -> 404 skipped (static asset)
-2026-05-20 21:03:00.000 ERROR [g7h8i9] GET /cat/Movies/2/ <- byparr request failed after 60.52s: timed out
+2026-05-23 19:49:17.863 INFO  byparr-proxy starting
+2026-05-23 19:49:17.866 INFO    upstream:   https://1337x.to
+2026-05-23 19:49:17.872 INFO    byparr:     http://byparr:8191/v1
+2026-05-23 19:49:17.872 INFO    timeout:    120000 ms
+2026-05-23 19:49:17.872 INFO    port:       8888
+2026-05-23 19:49:17.872 INFO    log level:  INFO
+2026-05-23 19:49:17.872 INFO    cache ttl:  3600 s
+2026-05-23 19:49:17.872 INFO    stub /cat/: on
+```
+
+Per-request log lines:
+
+```
+# Fresh fetch via Byparr, cached on success
+... INFO  [a1b2c3] GET /search/shrek2001/1/ from 172.18.0.7 -> forwarding to byparr (https://1337x.to/search/shrek2001/1/)
+... INFO  [a1b2c3] GET /search/shrek2001/1/ -> cached for 3600s (status 200, 26188 bytes)
+... INFO  [a1b2c3] GET /search/shrek2001/1/ <- 200 in 23.11s (byparr 23.09s, 26188 bytes)
+
+# Same path again within the TTL -- served from cache, no byparr roundtrip
+... INFO  [b2c3d4] GET /search/shrek2001/1/ from 172.18.0.7 -> cache hit (age 142s, ttl 3600s)
+... INFO  [b2c3d4] GET /search/shrek2001/1/ <- 200 in 0.01s (cache hit, 26188 bytes)
+
+# Two clients hit the same path concurrently -- second one waits on the first
+... INFO  [c3d4e5] GET /search/foo/1/ from 172.18.0.7 -> forwarding to byparr (https://1337x.to/search/foo/1/)
+... INFO  [d4e5f6] GET /search/foo/1/ from 172.18.0.8 -> coalescing with in-flight request
+... INFO  [c3d4e5] GET /search/foo/1/ <- 200 in 25.13s (byparr 25.11s, 18204 bytes)
+... INFO  [d4e5f6] GET /search/foo/1/ <- 200 in 25.13s (coalesced with in-flight, 18204 bytes)
+
+# /cat/... paths short-circuited by the stub
+... INFO  [e5f6a7] GET /cat/TV/1/ from 172.18.0.10 -> 200 stubbed (cat path, bypassing byparr)
+
+# Successful fetch but no /torrent/ links in the body -- not cached, so the next attempt retries
+... INFO  [f6a7b8] GET /search/somequery/1/ -> not cached (empty results, 870 bytes)
+
+# Static asset we never bother forwarding
+... INFO  [a7b8c9] GET /css/style.css from 172.18.0.7 -> 404 skipped (static asset)
+
+# Hard failure
+... ERROR [b8c9d0] GET /cat/Movies/2/ <- byparr request failed after 60.52s: HTTP Error 408: Request Timeout
 ```
 
 What to look for when something's wrong:
+- `not cached (empty results, ...)` on a search that should have hits: Byparr returned a stripped/skeleton page or a CF challenge fragment. Try again — the empty page is **not** cached, so retries actually retry.
 - Long `byparr` times (>60s) on every request: Byparr is overloaded or being challenged hard. Reduce concurrent searches.
 - `byparr returned non-ok`: Byparr itself failed to solve. Check `docker logs byparr`.
-- `byparr request failed: timed out`: the proxy is waiting longer than `TIMEOUT_MS`. Bump it if real solves consistently exceed it.
-- Bytes < 5000 on a 200 response: Byparr may be returning a small error/challenge page instead of real content. Spot-check the body manually.
+- `HTTP Error 408: Request Timeout`: Byparr's internal solve timeout fired. Pull a fresh `byparr:latest`, give it `shm_size: 1g` and `mem_limit: 2g`, and check its own logs for `TargetClosedError` (Chromium crash, usually `/dev/shm` exhaustion).
+- Bytes < 5000 on a 200 response that *should* have results: Byparr may be returning a small error/challenge page instead of real content. The empty-results detector should have logged `not cached` for this.
 
 ## Limitations
 
