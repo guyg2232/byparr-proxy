@@ -50,27 +50,50 @@ SKIP_EXT = re.compile(
 # /sort-search/, so this regex isolates the test traffic.
 CAT_PATH = re.compile(r"^/cat/", re.IGNORECASE)
 
-# Single fake row so Prowlarr's "0 results = failure" gate is satisfied during
-# indexer tests. 0 seeders ensures nothing ever picks it for download, and the
-# title is obviously synthetic if it leaks into a Prowlarr browse view.
-STUB_BODY = (
-    b"<!DOCTYPE html><html><head><title>byparr-proxy stub</title></head><body>"
-    b"<table class=\"table-list\"><tbody>"
-    b"<tr>"
-    b"<td class=\"coll-1 name\">"
-    b"<a href=\"/sub/40/0/\">Other</a>"
-    b"<a href=\"/torrent/0/byparr-proxy-stub-indexer-healthy/\">"
-    b"byparr-proxy stub - indexer healthy</a>"
-    b"</td>"
-    b"<td class=\"coll-2 seeds\">0</td>"
-    b"<td class=\"coll-3 leeches\">0</td>"
-    b"<td class=\"coll-date\">now</td>"
-    b"<td class=\"coll-4 size\">1 KB</td>"
-    b"<td class=\"coll-5 user\">byparr-proxy</td>"
-    b"</tr>"
-    b"</tbody></table>"
-    b"</body></html>"
-)
+# Fake rows -- one per major category family -- so every *arr app finds a
+# matching row when filtering by its configured category set. Sonarr filters
+# to TV, Radarr to Movies, Lidarr to Audio, etc.; a single-category stub
+# fails their tests with "no results in the configured categories".
+# 0 seeders ensures nothing ever grabs these synthetic entries, and the
+# titles are obviously fake if they leak into a Prowlarr browse view.
+_STUB_CATEGORIES = [
+    (42, "Movies/HD"),
+    (41, "TV/HD"),
+    (22, "Audio/MP3"),
+    (18, "Apps/PC"),
+    (10, "Games/PC"),
+    (36, "Books/EBook"),
+    (40, "Other/Misc"),
+]
+
+
+def _build_stub_body():
+    rows = []
+    for cat_id, label in _STUB_CATEGORIES:
+        rows.append(
+            f'<tr>'
+            f'<td class="coll-1 name">'
+            f'<a href="/sub/{cat_id}/0/">{label}</a>'
+            f'<a href="/torrent/{cat_id}/byparr-proxy-stub-{cat_id}/">'
+            f'byparr-proxy stub - {label} healthy</a>'
+            f'</td>'
+            f'<td class="coll-2 seeds">0</td>'
+            f'<td class="coll-3 leeches">0</td>'
+            f'<td class="coll-date">now</td>'
+            f'<td class="coll-4 size">1 KB</td>'
+            f'<td class="coll-5 user">byparr-proxy</td>'
+            f'</tr>'
+        )
+    html = (
+        '<!DOCTYPE html><html><head><title>byparr-proxy stub</title></head>'
+        '<body><table class="table-list"><tbody>'
+        + ''.join(rows) +
+        '</tbody></table></body></html>'
+    )
+    return html.encode("utf-8")
+
+
+STUB_BODY = _build_stub_body()
 
 logging.basicConfig(
     level=LOG_LEVEL,
